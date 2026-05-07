@@ -1,8 +1,14 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
+import os
 from app.core.config import settings
+from app.core.security import get_current_user_id, verify_user_owns_resource
 from app.db.base import engine, get_db
 from app.services.course_service import CourseService
 from app.schemas.rating import (
@@ -11,6 +17,8 @@ from app.schemas.rating import (
     RatingStatsResponse,
     ErrorResponse
 )
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title=settings.project_name,
@@ -46,6 +54,20 @@ app = FastAPI(
             "description": "Health check endpoints"
         }
     ]
+)
+
+# Rate limiting
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS
+_allowed_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["*"],
 )
 
 
@@ -88,9 +110,9 @@ def health() -> dict[str, str | bool | int]:
             else:
                 health_status["database"] = True
                 health_status["courses_count"] = 0
-    except Exception as e:
+    except Exception:
         health_status["status"] = "degraded"
-        health_status["database_error"] = str(e)
+        health_status["database_error"] = "Database connection failed"
 
     return health_status
 
@@ -151,13 +173,17 @@ def get_class_by_id(class_id: int, db: Session = Depends(get_db)) -> dict:
     responses={
         201: {"description": "Rating created successfully"},
         400: {"model": ErrorResponse, "description": "Validation error"},
+        403: {"model": ErrorResponse, "description": "Forbidden"},
         404: {"model": ErrorResponse, "description": "Course not found"}
     }
 )
+@limiter.limit("10/minute")
 def add_course_rating(
+    request: Request,
     course_id: int,
     rating_data: RatingRequest,
-    course_service: CourseService = Depends(get_course_service)
+    course_service: CourseService = Depends(get_course_service),
+    current_user_id: Optional[int] = Depends(get_current_user_id),
 ) -> RatingResponse:
     """
     Add a new rating to a course or update existing rating.
@@ -178,6 +204,7 @@ def add_course_rating(
             "rating": 5
         }
     """
+    verify_user_owns_resource(current_user_id, rating_data.user_id)
     try:
         result = course_service.add_course_rating(
             course_id=course_id,
@@ -349,14 +376,18 @@ def get_user_course_rating(
     responses={
         200: {"description": "Rating updated successfully"},
         400: {"model": ErrorResponse, "description": "Validation error"},
+        403: {"model": ErrorResponse, "description": "Forbidden"},
         404: {"model": ErrorResponse, "description": "Rating not found"}
     }
 )
+@limiter.limit("10/minute")
 def update_course_rating(
+    request: Request,
     course_id: int,
     user_id: int,
     rating_data: RatingRequest,
-    course_service: CourseService = Depends(get_course_service)
+    course_service: CourseService = Depends(get_course_service),
+    current_user_id: Optional[int] = Depends(get_current_user_id),
 ) -> RatingResponse:
     """
     Update an existing course rating.
@@ -375,13 +406,12 @@ def update_course_rating(
             "rating": 3
         }
     """
-    # Validar que user_id del body coincide con user_id del path
     if rating_data.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="user_id in body must match user_id in path"
         )
-
+    verify_user_owns_resource(current_user_id, user_id)
     try:
         result = course_service.update_course_rating(
             course_id=course_id,
@@ -402,13 +432,17 @@ def update_course_rating(
     tags=["ratings"],
     responses={
         204: {"description": "Rating deleted successfully"},
+        403: {"model": ErrorResponse, "description": "Forbidden"},
         404: {"model": ErrorResponse, "description": "Rating not found"}
     }
 )
+@limiter.limit("10/minute")
 def delete_course_rating(
+    request: Request,
     course_id: int,
     user_id: int,
-    course_service: CourseService = Depends(get_course_service)
+    course_service: CourseService = Depends(get_course_service),
+    current_user_id: Optional[int] = Depends(get_current_user_id),
 ) -> None:
     """
     Delete (soft delete) a course rating.
@@ -423,6 +457,7 @@ def delete_course_rating(
         Response:
         HTTP 204 No Content
     """
+    verify_user_owns_resource(current_user_id, user_id)
     success = course_service.delete_course_rating(course_id, user_id)
 
     if not success:
